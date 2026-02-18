@@ -1,12 +1,4 @@
 import { Head } from '@inertiajs/react';
-import AppLayout from '@/layouts/app-layout';
-import type { BreadcrumbItem } from '@/types';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
     Upload,
     X,
@@ -19,6 +11,15 @@ import {
     RefreshCw,
     Info
 } from 'lucide-react';
+import type { LucideIcon } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import AppLayout from '@/layouts/app-layout';
+import type { BreadcrumbItem } from '@/types';
 
 interface Receipt {
     id: number;
@@ -39,12 +40,15 @@ const breadcrumbs: BreadcrumbItem[] = [
     { title: 'Receipt Scanner', href: '/receipts' },
 ];
 
-const statusConfig: Record<string, { label: string; class: string; icon: any }> = {
-    pending: { label: 'Queued', class: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border-slate-200 dark:border-slate-700', icon: Clock },
-    processing: { label: 'Processing', class: 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-blue-200 dark:border-blue-800', icon: RefreshCw },
-    completed: { label: 'Verified', class: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800', icon: CheckCircle2 },
-    failed: { label: 'Rejected', class: 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 border-red-200 dark:border-red-800', icon: AlertCircle },
-    duplicate: { label: 'Duplicate', class: 'bg-orange-50 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300 border-orange-200 dark:border-orange-800', icon: AlertCircle },
+const statusConfig: Record<
+    string,
+    { label: string; class: string; icon: LucideIcon }
+> = {
+    pending: { label: 'Queued', class: '...', icon: Clock },
+    processing: { label: 'Processing', class: '...', icon: RefreshCw },
+    completed: { label: 'Verified', class: '...', icon: CheckCircle2 },
+    failed: { label: 'Rejected', class: '...', icon: AlertCircle },
+    duplicate: { label: 'Duplicate', class: '...', icon: AlertCircle },
 };
 
 export default function ReceiptsIndex() {

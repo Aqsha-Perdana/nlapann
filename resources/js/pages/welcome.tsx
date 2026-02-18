@@ -1,6 +1,6 @@
 import { Head, Link, usePage } from '@inertiajs/react';
+import { Building2, Wallet, ShieldCheck, Clock, ArrowRight, TrendingUp } from 'lucide-react';
 import { dashboard, login, register } from '@/routes';
-import { Receipt, Building2, Wallet, ShieldCheck, Clock, CheckCircle2, ArrowRight, TrendingUp } from 'lucide-react';
 
 export default function Welcome({
     canRegister = true,
