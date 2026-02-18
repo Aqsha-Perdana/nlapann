@@ -94,11 +94,19 @@ export default function Dashboard() {
     }, []);
 
     useEffect(() => {
-        fetchReceiptStats();
-        // Refresh stats every 5 seconds
-        const interval = setInterval(fetchReceiptStats, 5000);
+        const loadStats = async () => {
+            await fetchReceiptStats();
+        };
+
+        loadStats();
+
+        const interval = setInterval(() => {
+            loadStats();
+        }, 5000);
+
         return () => clearInterval(interval);
     }, [fetchReceiptStats]);
+
 
     const statsConfig = getStatsConfig();
 
