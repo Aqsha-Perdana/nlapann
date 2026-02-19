@@ -81,7 +81,7 @@ export default function Welcome({
                                     <Building2 className="h-5 w-5 text-white" />
                                 </div>
                                 <span className="text-xl font-bold tracking-tight text-foreground">
-                                    Corp<span className="text-blue-700 dark:text-blue-400">Reimburse</span>
+                                    TEAM<span className="text-blue-700 dark:text-blue-400"> 4</span>
                                 </span>
                             </div>
 

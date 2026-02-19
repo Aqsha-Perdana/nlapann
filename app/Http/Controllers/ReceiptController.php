@@ -15,57 +15,82 @@ class ReceiptController extends Controller
      * Upload receipt image, save to storage, and send to n8n webhook.
      */
     public function upload(Request $request): JsonResponse
-{
-    $request->validate([
-        'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:10240',
-        'webhook_url' => 'nullable|url',
-    ]);
+    {
+        $request->validate([
+            'image' => 'required|image|mimes:jpeg,png,jpg,gif,webp|max:10240',
+            'webhook_url' => 'nullable|url',
+        ]);
 
-    // Save image
-    $path = $request->file('image')->store('receipts', 'public');
+        // Save image
+        $path = $request->file('image')->store('receipts', 'public');
 
-    // Create receipt record
-    $receipt = Receipt::create([
-        'user_id' => $request->user()?->id,
-        'image_path' => $path,
-        'status' => 'processing', // langsung processing
-    ]);
+        // Create receipt record
+        $receipt = Receipt::create([
+            'user_id' => $request->user()?->id,
+            'image_path' => $path,
+            'status' => 'processing',
+        ]);
 
-    $webhookUrl = $request->input('webhook_url') ?: config('services.n8n.webhook_url');
+        $webhookUrl = $request->input('webhook_url') ?: config('services.n8n.webhook_url');
 
-    if (!$webhookUrl) {
-        return response()->json([
-            'success' => false,
-            'message' => 'Webhook URL tidak ditemukan',
-        ], 500);
-    }
+        if (!$webhookUrl) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Webhook URL tidak ditemukan',
+            ], 500);
+        }
 
-    try {
-        $imageContent = Storage::disk('public')->get($path);
+        try {
+            $imageContent = Storage::disk('public')->get($path);
 
-        $payload = [
-            'receipt_id' => $receipt->id,
-            'image_base64' => base64_encode($imageContent),
-            'mime_type' => $request->file('image')->getMimeType(),
-            'filename' => $request->file('image')->getClientOriginalName(),
-            'callback_url' => url('/api/receipts/webhook-callback'),
-        ];
+            // Ambil user untuk mendapatkan nama
+            // Load relasi user dari receipt untuk memastikan data user tersedia
+            $receipt->load('user');
+            $user = $receipt->user;
 
-        $response = Http::timeout(60)->post($webhookUrl, $payload);
+            $payload = [
+                'receipt_id'   => $receipt->id,
+                'user_id'      => $receipt->user_id,
+                'employee_name' => $user?->name ?? 'Unknown User',  // ← DITAMBAHKAN
+                'image_base64' => base64_encode($imageContent),
+                'mime_type'    => $request->file('image')->getMimeType(),
+                'filename'     => $request->file('image')->getClientOriginalName(),
+                'callback_url' => url('/api/receipts/webhook-callback'),
+            ];
 
-        if (!$response->successful()) {
-            $status = $response->status();
-            $errorMessage = "Gagal memproses struk di n8n (Status: $status).";
+            $response = Http::timeout(60)->post($webhookUrl, $payload);
 
-            if ($status >= 400 && $status < 500) {
-                $errorMessage = "Webhook n8n menolak request (Error $status). Cek konfigurasi webhook.";
-            } elseif ($status >= 500) {
-                $errorMessage = "Terjadi kesalahan internal di server n8n (Error $status). Cek log n8n.";
+            if (!$response->successful()) {
+                $status = $response->status();
+                $errorMessage = "Gagal memproses struk di n8n (Status: $status).";
+
+                if ($status >= 400 && $status < 500) {
+                    $errorMessage = "Webhook n8n menolak request (Error $status). Cek konfigurasi webhook.";
+                } elseif ($status >= 500) {
+                    $errorMessage = "Terjadi kesalahan internal di server n8n (Error $status). Cek log n8n.";
+                }
+
+                Log::error('n8n webhook failed', [
+                    'status' => $status,
+                    'body' => $response->body(),
+                ]);
+
+                $receipt->update([
+                    'status' => 'failed',
+                    'error_message' => $errorMessage
+                ]);
             }
 
-            Log::error('n8n webhook failed', [
-                'status' => $status,
-                'body' => $response->body(),
+        } catch (\Exception $e) {
+            $errorMessage = "Terjadi kesalahan sistem saat mengirim ke n8n.";
+            
+            // Check for connection/timeout errors
+            if (str_contains(strtolower($e->getMessage()), 'curl') || str_contains(strtolower($e->getMessage()), 'timeout')) {
+                $errorMessage = "Gagal menghubungi n8n (Timeout/Connection Error). Pastikan n8n berjalan dan URL webhook benar.";
+            }
+
+            Log::error('Failed sending to n8n', [
+                'error' => $e->getMessage(),
             ]);
 
             $receipt->update([
@@ -74,30 +99,12 @@ class ReceiptController extends Controller
             ]);
         }
 
-    } catch (\Exception $e) {
-        $errorMessage = "Terjadi kesalahan sistem saat mengirim ke n8n.";
-        
-        // Check for connection/timeout errors
-        if (str_contains(strtolower($e->getMessage()), 'curl') || str_contains(strtolower($e->getMessage()), 'timeout')) {
-            $errorMessage = "Gagal menghubungi n8n (Timeout/Connection Error). Pastikan n8n berjalan dan URL webhook benar.";
-        }
-
-        Log::error('Failed sending to n8n', [
-            'error' => $e->getMessage(),
-        ]);
-
-        $receipt->update([
-            'status' => 'failed',
-            'error_message' => $errorMessage
-        ]);
+        return response()->json([
+            'success' => true,
+            'receipt' => $receipt->fresh(),
+            'message' => 'Struk sedang diproses',
+        ], 201);
     }
-
-    return response()->json([
-        'success' => true,
-        'receipt' => $receipt->fresh(),
-        'message' => 'Struk sedang diproses',
-    ], 201);
-}
 
 
     /**
@@ -137,6 +144,33 @@ class ReceiptController extends Controller
 
         return response()->json([
             'receipts' => $receipts,
+        ]);
+    }
+
+    /**
+     * Update a receipt manually.
+     */
+    public function update(Request $request, Receipt $receipt): JsonResponse
+    {
+        $validated = $request->validate([
+            'store_name' => 'nullable|string|max:255',
+            'receipt_date' => 'nullable|date',
+            'total_amount' => 'nullable|numeric',
+            'payment_method' => 'nullable|string|max:255',
+            'status' => 'nullable|string|in:pending,processing,completed,failed,duplicate',
+        ]);
+
+        // If user is editing, we assume they are verifying the data
+        if (!isset($validated['status']) && in_array($receipt->status, ['processing', 'failed'])) {
+            $validated['status'] = 'completed';
+        }
+
+        $receipt->update($validated);
+
+        return response()->json([
+            'success' => true,
+            'receipt' => $receipt->fresh(),
+            'message' => 'Data struk berhasil diupdate',
         ]);
     }
 

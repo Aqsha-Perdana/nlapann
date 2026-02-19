@@ -9,7 +9,10 @@ import {
     Settings,
     ScanLine,
     RefreshCw,
-    Info
+    Info,
+    ShieldCheck,
+    ShieldX,
+    Loader2
 } from 'lucide-react';
 import type { LucideIcon } from "lucide-react";
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -20,6 +23,8 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import AppLayout from '@/layouts/app-layout';
 import type { BreadcrumbItem } from '@/types';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Receipt {
     id: number;
@@ -34,6 +39,67 @@ interface Receipt {
     error_message: string | null;
     created_at: string;
 }
+
+type ScanStatus = 'idle' | 'scanning' | 'passed' | 'rejected';
+
+// ─── MobileNet global type (loaded via CDN) ───────────────────────────────────
+declare global {
+    interface Window {
+        mobilenet?: {
+            load: () => Promise<{
+                classify: (
+                    img: HTMLImageElement | HTMLCanvasElement,
+                    topk?: number
+                ) => Promise<Array<{ className: string; probability: number }>>;
+            }>;
+        };
+    }
+}
+
+// ─── BLACKLIST: gambar yang PASTI bukan struk ─────────────────────────────────
+// Jika top predictions mengandung salah satu kata ini → langsung REJECT
+const NON_RECEIPT_BLACKLIST = [
+    // Orang & tubuh
+    'person', 'people', 'man', 'woman', 'boy', 'girl', 'child', 'face',
+    'selfie', 'portrait', 'human', 'body', 'hand', 'finger',
+    // Kartun & ilustrasi
+    'cartoon', 'comic', 'illustration', 'drawing', 'sketch', 'anime',
+    'animation', 'character', 'mascot', 'doodle', 'clip art',
+    // Hewan
+    'cat', 'dog', 'bird', 'fish', 'animal', 'pet', 'wildlife',
+    'horse', 'cow', 'pig', 'chicken', 'rabbit', 'bear', 'lion',
+    // Alam & outdoor
+    'mountain', 'beach', 'ocean', 'sea', 'sky', 'cloud', 'tree',
+    'forest', 'flower', 'grass', 'landscape', 'nature', 'sunset',
+    // Makanan & minuman
+    'food', 'meal', 'dish', 'pizza', 'burger', 'cake', 'coffee',
+    'drink', 'fruit', 'vegetable', 'restaurant plate',
+    // Kendaraan
+    'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'vehicle', 'airplane',
+    // Bangunan & interior (bukan dokumen)
+    'room', 'bedroom', 'bathroom', 'kitchen', 'living room',
+    // Elektronik & gadget
+    'phone', 'laptop', 'computer', 'keyboard', 'screen', 'television',
+    // Pakaian & aksesori
+    'shirt', 'dress', 'shoe', 'bag', 'hat', 'glasses',
+    // Olahraga
+    'ball', 'sport', 'game', 'stadium',
+];
+
+// ─── WHITELIST: kata kunci yang HARUS ada agar dianggap struk/dokumen ─────────
+const RECEIPT_WHITELIST = [
+    'receipt', 'invoice', 'bill', 'ticket', 'voucher',
+    'document', 'paper', 'envelope', 'book', 'menu', 'label',
+    'newspaper', 'magazine', 'letter', 'card', 'form', 'check',
+    'notebook', 'folder', 'binder', 'printed matter',
+    'cash register', 'money', 'banknote', 'wallet',
+    'shopping', 'grocery', 'store receipt',
+];
+
+// Threshold: total probability dari whitelist keywords harus >= ini
+const WHITELIST_THRESHOLD = 0.12;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const breadcrumbs: BreadcrumbItem[] = [
     { title: 'Dashboard', href: '/dashboard' },
@@ -51,6 +117,8 @@ const statusConfig: Record<
     duplicate: { label: 'Duplicate', class: '...', icon: AlertCircle },
 };
 
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function ReceiptsIndex() {
     const [receipts, setReceipts] = useState<Receipt[]>([]);
     const [webhookUrl, setWebhookUrl] = useState('');
@@ -61,11 +129,20 @@ export default function ReceiptsIndex() {
     const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
     const [selectedReceipt, setSelectedReceipt] = useState<Receipt | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const previewImgRef = useRef<HTMLImageElement>(null);
 
-    // Fetch receipts
+    // AI scan state
+    const [scanStatus, setScanStatus] = useState<ScanStatus>('idle');
+    const [scanDetail, setScanDetail] = useState<string>('');
+
+    // ── Fetch receipts ────────────────────────────────────────────────────────
     const fetchReceipts = useCallback(async () => {
         try {
-            const res = await fetch('/api/receipts');
+            const res = await fetch('/api/receipts', {
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+            });
             const data = await res.json();
             setReceipts(data.receipts || []);
         } catch {
@@ -79,7 +156,90 @@ export default function ReceiptsIndex() {
         return () => clearInterval(interval);
     }, [fetchReceipts]);
 
-    // Drag handlers
+    // ── AI Scan ───────────────────────────────────────────────────────────────
+    const runAIScan = useCallback(async (file: File): Promise<boolean> => {
+        setScanStatus('scanning');
+        setScanDetail('');
+
+        try {
+            if (!window.mobilenet) {
+                // Model CDN belum siap — tolak dengan pesan informatif
+                console.warn('[AI Scan] MobileNet not available.');
+                setScanStatus('rejected');
+                setScanDetail('Model AI belum siap. Coba refresh halaman.');
+                return false;
+            }
+
+            // ! assertions safe karena sudah dicek di atas
+            const model = await window.mobilenet!.load();
+
+            const img = new Image();
+            const objectUrl = URL.createObjectURL(file);
+            await new Promise<void>((resolve, reject) => {
+                img.onload = () => resolve();
+                img.onerror = reject;
+                img.src = objectUrl;
+            });
+
+            // Ambil top 10 predictions untuk analisis lebih lengkap
+            const predictions = await model.classify(img, 10);
+            URL.revokeObjectURL(objectUrl);
+
+            console.log('[AI Scan] Predictions:', predictions);
+
+            // ── STEP 1: BLACKLIST CHECK ──────────────────────────────────────
+            // Jika ada prediction blacklist dengan confidence > 15% → langsung REJECT
+            for (const pred of predictions) {
+                const label = pred.className.toLowerCase();
+                const isBlacklisted = NON_RECEIPT_BLACKLIST.some((kw: string) => label.includes(kw));
+                if (isBlacklisted && pred.probability > 0.15) {
+                    setScanStatus('rejected');
+                    setScanDetail(`Terdeteksi sebagai: "${pred.className}" (${(pred.probability * 100).toFixed(0)}%) — bukan dokumen`);
+                    return false;
+                }
+            }
+
+            // ── STEP 2: WHITELIST CHECK ──────────────────────────────────────
+            // Hitung total score dari kata kunci dokumen/struk
+            let whitelistScore = 0;
+            let matchedLabel = '';
+
+            for (const pred of predictions) {
+                const label = pred.className.toLowerCase();
+                const isWhitelisted = RECEIPT_WHITELIST.some((kw: string) => label.includes(kw));
+                if (isWhitelisted) {
+                    whitelistScore += pred.probability;
+                    if (!matchedLabel) matchedLabel = pred.className;
+                }
+            }
+
+            if (whitelistScore >= WHITELIST_THRESHOLD) {
+                setScanStatus('passed');
+                setScanDetail(`Terdeteksi: "${matchedLabel}" (${(whitelistScore * 100).toFixed(0)}% confidence)`);
+                return true;
+            }
+
+            // ── STEP 3: FAIL-STRICT ──────────────────────────────────────────
+            // Tidak ada bukti kuat bahwa ini dokumen → TOLAK
+            const top1 = predictions[0];
+            setScanStatus('rejected');
+            setScanDetail(
+                top1
+                    ? `Tidak terdeteksi sebagai struk. Prediksi teratas: "${top1.className}" (${(top1.probability * 100).toFixed(0)}%)`
+                    : 'Gambar tidak dapat diidentifikasi sebagai struk/dokumen.'
+            );
+            return false;
+
+        } catch (err) {
+            console.error('[AI Scan] Error:', err);
+            // Error saat scan → tolak untuk keamanan
+            setScanStatus('rejected');
+            setScanDetail('Gagal memvalidasi gambar. Coba lagi.');
+            return false;
+        }
+    }, []);
+
+    // ── File handlers ─────────────────────────────────────────────────────────
     const handleDrag = (e: React.DragEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -99,7 +259,7 @@ export default function ReceiptsIndex() {
         }
     };
 
-    const handleFileSelect = (file: File) => {
+    const handleFileSelect = async (file: File) => {
         if (!file.type.startsWith('image/')) {
             setMessage({ text: 'Please upload an image file (JPG, PNG)', type: 'error' });
             return;
@@ -107,10 +267,31 @@ export default function ReceiptsIndex() {
         setSelectedFile(file);
         setPreviewUrl(URL.createObjectURL(file));
         setMessage(null);
+        setScanStatus('idle');
+        setScanDetail('');
+
+        // Run AI scan immediately after file selection
+        await runAIScan(file);
     };
 
+    // ── Upload ────────────────────────────────────────────────────────────────
     const handleUpload = async () => {
         if (!selectedFile) return;
+
+        // Block upload if AI scan rejected the image
+        if (scanStatus === 'rejected') {
+            setMessage({
+                text: '❌ Gambar ini bukan struk. Harap upload foto struk/nota yang valid.',
+                type: 'error',
+            });
+            return;
+        }
+
+        // If still scanning, wait
+        if (scanStatus === 'scanning') {
+            setMessage({ text: 'Mohon tunggu, AI sedang memvalidasi gambar...', type: 'error' });
+            return;
+        }
 
         setUploading(true);
         setMessage(null);
@@ -127,6 +308,7 @@ export default function ReceiptsIndex() {
                 body: formData,
                 headers: {
                     'X-Requested-With': 'XMLHttpRequest',
+                    'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '',
                 },
             });
 
@@ -136,6 +318,8 @@ export default function ReceiptsIndex() {
                 setMessage({ text: data.message || 'Receipt uploaded successfully', type: 'success' });
                 setSelectedFile(null);
                 setPreviewUrl(null);
+                setScanStatus('idle');
+                setScanDetail('');
                 fetchReceipts();
             } else {
                 const errors = data.errors ? Object.values(data.errors).flat().join(', ') : data.message;
@@ -151,9 +335,13 @@ export default function ReceiptsIndex() {
     const clearFile = () => {
         setSelectedFile(null);
         setPreviewUrl(null);
+        setScanStatus('idle');
+        setScanDetail('');
+        setMessage(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
     };
 
+    // ── Formatters ────────────────────────────────────────────────────────────
     const formatCurrency = (amount: string | null) => {
         if (!amount) return '-';
         return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR' }).format(Number(amount));
@@ -164,6 +352,48 @@ export default function ReceiptsIndex() {
         return new Date(dateStr).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' });
     };
 
+    // ── Scan badge UI ─────────────────────────────────────────────────────────
+    const ScanBadge = () => {
+        if (scanStatus === 'idle') return null;
+
+        if (scanStatus === 'scanning') {
+            return (
+                <div className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 dark:bg-blue-900/20 dark:border-blue-800 px-3 py-2 text-xs text-blue-700 dark:text-blue-300 animate-pulse">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+                    <span className="font-medium">AI sedang memvalidasi gambar...</span>
+                </div>
+            );
+        }
+
+        if (scanStatus === 'passed') {
+            return (
+                <div className="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 dark:bg-emerald-900/20 dark:border-emerald-800 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+                    <ShieldCheck className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                    <div>
+                        <p className="font-semibold">✅ Gambar valid</p>
+                        {scanDetail && <p className="opacity-80 mt-0.5">{scanDetail}</p>}
+                    </div>
+                </div>
+            );
+        }
+
+        if (scanStatus === 'rejected') {
+            return (
+                <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 dark:bg-red-900/20 dark:border-red-800 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+                    <ShieldX className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                    <div>
+                        <p className="font-semibold">❌ Bukan struk/dokumen</p>
+                        {scanDetail && <p className="opacity-80 mt-0.5">{scanDetail}</p>}
+                        <p className="mt-1 opacity-70">Harap upload foto struk, nota, atau dokumen keuangan.</p>
+                    </div>
+                </div>
+            );
+        }
+
+        return null;
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
     return (
         <AppLayout breadcrumbs={breadcrumbs}>
             <Head title="Receipt Scanner" />
@@ -197,7 +427,11 @@ export default function ReceiptsIndex() {
                                     <div
                                         className={`relative flex min-h-[260px] cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed transition-all duration-300 ${dragActive
                                             ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 scale-[1.02]'
-                                            : 'border-muted-foreground/25 hover:border-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-900/10'
+                                            : scanStatus === 'rejected'
+                                                ? 'border-red-400 bg-red-50/30 dark:bg-red-900/10'
+                                                : scanStatus === 'passed'
+                                                    ? 'border-emerald-400 bg-emerald-50/30 dark:bg-emerald-900/10'
+                                                    : 'border-muted-foreground/25 hover:border-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-900/10'
                                             } ${previewUrl ? 'border-none p-0 overflow-hidden bg-black' : ''}`}
                                         onDragEnter={handleDrag}
                                         onDragLeave={handleDrag}
@@ -217,8 +451,10 @@ export default function ReceiptsIndex() {
 
                                         {previewUrl ? (
                                             <div className="relative w-full h-full flex flex-col items-center justify-center bg-black/90">
+                                                {/* Top gradient bar */}
                                                 <div className="absolute top-0 w-full h-1 bg-gradient-to-r from-blue-500 via-indigo-500 to-blue-500 animate-shimmer z-10" />
                                                 <img
+                                                    ref={previewImgRef}
                                                     src={previewUrl}
                                                     alt="Preview"
                                                     className="max-h-[260px] w-full object-contain opacity-80"
@@ -232,8 +468,34 @@ export default function ReceiptsIndex() {
                                                     <X className="h-4 w-4" />
                                                 </Button>
 
-                                                {/* Scanning Overlay Effect */}
-                                                <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-blue-500/10 to-transparent animate-scan" style={{ animationDuration: '2s' }} />
+                                                {/* Scanning overlay */}
+                                                {scanStatus === 'scanning' && (
+                                                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 z-20 gap-3">
+                                                        <Loader2 className="h-10 w-10 text-blue-400 animate-spin" />
+                                                        <p className="text-white text-sm font-semibold tracking-wide">
+                                                            🔍 AI Memvalidasi...
+                                                        </p>
+                                                    </div>
+                                                )}
+
+                                                {/* Scan result overlay badge */}
+                                                {scanStatus === 'passed' && (
+                                                    <div className="absolute bottom-2 left-2 right-2 flex items-center gap-1.5 bg-emerald-600/90 text-white text-xs font-semibold px-3 py-1.5 rounded-lg z-20">
+                                                        <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                                                        Terverifikasi sebagai dokumen
+                                                    </div>
+                                                )}
+                                                {scanStatus === 'rejected' && (
+                                                    <div className="absolute bottom-2 left-2 right-2 flex items-center gap-1.5 bg-red-600/90 text-white text-xs font-semibold px-3 py-1.5 rounded-lg z-20">
+                                                        <ShieldX className="h-3.5 w-3.5 shrink-0" />
+                                                        Bukan struk — upload diblokir
+                                                    </div>
+                                                )}
+
+                                                {/* Scanning scan-line effect */}
+                                                {scanStatus !== 'rejected' && (
+                                                    <div className="absolute inset-0 pointer-events-none bg-gradient-to-b from-blue-500/10 to-transparent animate-scan" style={{ animationDuration: '2s' }} />
+                                                )}
                                             </div>
                                         ) : (
                                             <div className="flex flex-col items-center gap-4 p-8 text-center">
@@ -252,6 +514,9 @@ export default function ReceiptsIndex() {
                                         )}
                                     </div>
 
+                                    {/* AI Scan Badge */}
+                                    {selectedFile && <ScanBadge />}
+
                                     {/* Actions */}
                                     {selectedFile && (
                                         <div className="flex flex-col gap-3 animate-slide-up">
@@ -260,14 +525,29 @@ export default function ReceiptsIndex() {
                                                 <span className="text-muted-foreground">{(selectedFile.size / 1024 / 1024).toFixed(2)} MB</span>
                                             </div>
                                             <Button
-                                                className="w-full bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-600/20 h-10 font-medium"
+                                                className={`w-full shadow-lg h-10 font-medium transition-all ${scanStatus === 'rejected'
+                                                    ? 'bg-red-500 hover:bg-red-600 shadow-red-500/20 cursor-not-allowed opacity-70'
+                                                    : scanStatus === 'scanning'
+                                                        ? 'bg-blue-400 shadow-blue-400/20 cursor-wait opacity-80'
+                                                        : 'bg-blue-600 hover:bg-blue-700 shadow-blue-600/20'
+                                                    }`}
                                                 onClick={handleUpload}
-                                                disabled={uploading}
+                                                disabled={uploading || scanStatus === 'scanning' || scanStatus === 'rejected'}
                                             >
                                                 {uploading ? (
                                                     <>
                                                         <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
                                                         Processing...
+                                                    </>
+                                                ) : scanStatus === 'scanning' ? (
+                                                    <>
+                                                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                                        Memvalidasi...
+                                                    </>
+                                                ) : scanStatus === 'rejected' ? (
+                                                    <>
+                                                        <ShieldX className="mr-2 h-4 w-4" />
+                                                        Upload Diblokir
                                                     </>
                                                 ) : (
                                                     <>
